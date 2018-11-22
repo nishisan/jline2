@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2012, the original author or authors.
+ * Copyright (c) 2002-2016, the original author or authors.
  *
  * This software is distributable under the BSD license. See the terms of the
  * BSD license in the documentation provided with this software.
@@ -34,9 +34,15 @@ public class EditLineTest
     }
 
     @Test
-    public void testMoveToEnd() throws Exception {
-        Buffer b = new Buffer("This is a test");
+    public void testDeleteNextWord() throws Exception {
+        Buffer b = new Buffer("This is a test").op(END_OF_LINE);
 
+        assertBuffer("This is a test", b = b.op(KILL_WORD));
+        assertBuffer("This is a ", b = b.op(BACKWARD_WORD).op(KILL_WORD));
+    }
+
+    @Test
+    public void testMoveToEnd() throws Exception {
         assertBuffer("This is a XtestX",
             new Buffer("This is a test").op(BACKWARD_WORD)
                 .append('X')
@@ -169,5 +175,22 @@ public class EditLineTest
     @Test
     public void testBuffer() throws Exception {
         assertBuffer("This is a test", new Buffer("This is a test"));
+    }
+
+    @Test
+    public void testAbortPartialBuffer() throws Exception {
+        console.setBellEnabled(true);
+        assertBuffer("", new Buffer("This is a test").ctrl('G'));
+        assertConsoleOutputContains('\n');
+        assertBeeped();
+
+        consoleOutputStream.reset();
+
+        assertBuffer("",
+            new Buffer("This is a test").op(BACKWARD_WORD)
+                                        .op(BACKWARD_WORD)
+                                        .ctrl('G'));
+        assertConsoleOutputContains('\n');
+        assertBeeped();
     }
 }

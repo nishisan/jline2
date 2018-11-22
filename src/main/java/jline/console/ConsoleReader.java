@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2012, the original author or authors.
+ * Copyright (c) 2002-2016, the original author or authors.
  *
  * This software is distributable under the BSD license. See the terms of the
  * BSD license in the documentation provided with this software.
@@ -15,8 +15,6 @@ import java.awt.datatransfer.Transferable;
 import java.awt.datatransfer.UnsupportedFlavorException;
 import java.awt.event.ActionListener;
 import java.io.BufferedReader;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
@@ -26,32 +24,38 @@ import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.io.Writer;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.net.URL;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.ListIterator;
-import java.util.Map;
 import java.util.ResourceBundle;
 import java.util.Stack;
 
+import jline.DefaultTerminal2;
 import jline.Terminal;
+import jline.Terminal2;
 import jline.TerminalFactory;
+import jline.UnixTerminal;
 import jline.console.completer.CandidateListCompletionHandler;
 import jline.console.completer.Completer;
 import jline.console.completer.CompletionHandler;
 import jline.console.history.History;
 import jline.console.history.MemoryHistory;
+import jline.internal.Ansi;
 import jline.internal.Configuration;
+import jline.internal.Curses;
 import jline.internal.InputStreamReader;
 import jline.internal.Log;
 import jline.internal.NonBlockingInputStream;
 import jline.internal.Nullable;
+import jline.internal.TerminalLineSettings;
 import jline.internal.Urls;
-import org.fusesource.jansi.AnsiOutputStream;
 
 import static jline.internal.Preconditions.checkNotNull;
 
@@ -78,6 +82,8 @@ public class ConsoleReader
 
     public static final String DEFAULT_INPUT_RC = "/etc/inputrc";
 
+    public static final String JLINE_EXPAND_EVENTS = "jline.expandevents";
+
     public static final char BACKSPACE = '\b';
 
     public static final char RESET_LINE = '\r';
@@ -86,27 +92,37 @@ public class ConsoleReader
 
     public static final char NULL_MASK = 0;
 
-    public static final int TAB_WIDTH = 4;
+    public static final int TAB_WIDTH = 8;
 
     private static final ResourceBundle
         resources = ResourceBundle.getBundle(CandidateListCompletionHandler.class.getName());
 
-    private final Terminal terminal;
+    private static final int ESCAPE = 27;
+    private static final int READ_EXPIRED = -2;
+
+    private final Terminal2 terminal;
 
     private final Writer out;
 
     private final CursorBuffer buf = new CursorBuffer();
+    private boolean cursorOk;
 
     private String prompt;
     private int    promptLen;
 
-    private boolean expandEvents = true;
+    private boolean expandEvents = Configuration.getBoolean(JLINE_EXPAND_EVENTS, true);
 
     private boolean bellEnabled = !Configuration.getBoolean(JLINE_NOBELL, true);
+
+    private boolean handleUserInterrupt = false;
+
+    private boolean handleLitteralNext = true;
 
     private Character mask;
 
     private Character echoCharacter;
+
+    private CursorBuffer originalBuffer = null;
 
     private StringBuffer searchTerm = null;
 
@@ -116,6 +132,10 @@ public class ConsoleReader
 
     private int parenBlinkTimeout = 500;
 
+    // Reading buffers
+    private final StringBuilder opBuffer = new StringBuilder();
+    private final Stack<Character> pushBackChar = new Stack<Character>();
+
     /*
      * The reader and the nonBlockingInput go hand-in-hand.  The reader wraps
      * the nonBlockingInput, but we have to retain a handle to it so that
@@ -124,12 +144,6 @@ public class ConsoleReader
     private NonBlockingInputStream in;
     private long                   escapeTimeout;
     private Reader                 reader;
-
-    /*
-     * TODO: Please read the comments about this in setInput(), but this needs
-     * to be done away with.
-     */
-    private boolean                isUnitTestInput;
 
     /**
      * Last character searched for with a vi character search
@@ -143,7 +157,11 @@ public class ConsoleReader
      */
     private String yankBuffer = "";
 
+    private KillRing killRing = new KillRing();
+
     private String encoding;
+
+    private boolean quotedInsert;
 
     private boolean recording;
 
@@ -158,6 +176,15 @@ public class ConsoleReader
     private String commentBegin = null;
 
     private boolean skipLF = false;
+
+    /**
+     * Set to true if the reader should attempt to detect copy-n-paste. The
+     * effect of this that an attempt is made to detect if tab is quickly
+     * followed by another character, then it is assumed that the tab was
+     * a literal tab as part of a copy-and-paste operation and is inserted as
+     * such.
+     */
+    private boolean copyPasteDetection = false;
 
     /*
      * Current internal state of the line reader
@@ -176,6 +203,7 @@ public class ConsoleReader
          * In the middle of a emacs seach
          */
         SEARCH,
+        FORWARD_SEARCH,
         /**
          * VI "yank-to" operation ("y" during move mode)
          */
@@ -211,16 +239,54 @@ public class ConsoleReader
     {
         this.appName = appName != null ? appName : "JLine";
         this.encoding = encoding != null ? encoding : Configuration.getEncoding();
-        this.terminal = term != null ? term : TerminalFactory.get();
-        this.out = new OutputStreamWriter(terminal.wrapOutIfNeeded(out), this.encoding);
+        Terminal terminal = term != null ? term : TerminalFactory.get();
+        this.terminal = terminal instanceof Terminal2 ? (Terminal2) terminal : new DefaultTerminal2(terminal);
+        String outEncoding = terminal.getOutputEncoding() != null? terminal.getOutputEncoding() : this.encoding;
+        this.out = new OutputStreamWriter(terminal.wrapOutIfNeeded(out), outEncoding);
         setInput( in );
 
         this.inputrcUrl = getInputRc();
 
-        consoleKeys = new ConsoleKeys(appName, inputrcUrl);
+        consoleKeys = new ConsoleKeys(this.appName, inputrcUrl);
+
+        if (terminal instanceof UnixTerminal
+                && TerminalLineSettings.DEFAULT_TTY.equals(((UnixTerminal) terminal).getSettings().getTtyDevice())
+                && Configuration.getBoolean("jline.sigcont", false)) {
+            setupSigCont();
+        }
     }
 
-    private URL getInputRc() throws IOException {
+    private void setupSigCont() {
+        // Check that sun.misc.SignalHandler and sun.misc.Signal exists
+        try {
+            Class<?> signalClass = Class.forName("sun.misc.Signal");
+            Class<?> signalHandlerClass = Class.forName("sun.misc.SignalHandler");
+            // Implement signal handler
+            Object signalHandler = Proxy.newProxyInstance(getClass().getClassLoader(),
+                    new Class<?>[]{signalHandlerClass}, new InvocationHandler() {
+                        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                            // only method we are proxying is handle()
+                            terminal.init();
+                            try {
+                                drawLine();
+                                flush();
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
+                            return null;
+                        }
+                    });
+            // Register the signal handler, this code is equivalent to:
+            // Signal.handle(new Signal("CONT"), signalHandler);
+            signalClass.getMethod("handle", signalClass, signalHandlerClass).invoke(null, signalClass.getConstructor(String.class).newInstance("CONT"), signalHandler);
+        } catch (ClassNotFoundException cnfe) {
+            // sun.misc Signal handler classes don't exist
+        } catch (Exception e) {
+            // Ignore this one too, if the above failed, the signal API is incompatible with what we're expecting
+        }
+    }
+
+    private static URL getInputRc() throws IOException {
         String path = Configuration.getString(JLINE_INPUTRC);
         if (path == null) {
             File f = new File(Configuration.getUserHome(), INPUT_RC);
@@ -239,19 +305,6 @@ public class ConsoleReader
 
     void setInput(final InputStream in) throws IOException {
         this.escapeTimeout = Configuration.getLong(JLINE_ESC_TIMEOUT, 100);
-        /*
-         * This is gross and here is how to fix it. In getCurrentPosition()
-         * and getCurrentAnsiRow(), the logic is disabled when running unit
-         * tests and the fact that it is a unit test is determined by knowing
-         * if the original input stream was a ByteArrayInputStream. So, this
-         * is our test to do this.  What SHOULD happen is that the unit
-         * tests should pass in a terminal that is appropriately configured
-         * such that whatever behavior they expect to happen (or not happen)
-         * happens (or doesn't).
-         *
-         * So, TODO, get rid of this and fix the unit tests.
-         */
-        this.isUnitTestInput = in instanceof ByteArrayInputStream;
         boolean nonBlockingEnabled =
                escapeTimeout > 0L
             && terminal.isSupported()
@@ -320,6 +373,23 @@ public class ConsoleReader
     }
 
     /**
+     * Enables or disables copy and paste detection. The effect of enabling this
+     * this setting is that when a tab is received immediately followed by another
+     * character, the tab will not be treated as a completion, but as a tab literal.
+     * @param onoff true if detection is enabled
+     */
+    public void setCopyPasteDetection(final boolean onoff) {
+        copyPasteDetection = onoff;
+    }
+
+    /**
+     * @return true if copy and paste detection is enabled.
+     */
+    public boolean isCopyPasteDetectionEnabled() {
+        return copyPasteDetection;
+    }
+
+    /**
      * Set whether the console bell is enabled.
      *
      * @param enabled true if enabled; false otherwise
@@ -337,6 +407,48 @@ public class ConsoleReader
      */
     public boolean getBellEnabled() {
         return bellEnabled;
+    }
+
+    /**
+     * Set whether user interrupts (ctrl-C) are handled by having JLine
+     * throw {@link UserInterruptException} from {@link #readLine}.
+     * Otherwise, the JVM will handle {@code SIGINT} as normal, which
+     * usually causes it to exit. The default is {@code false}.
+     *
+     * @since 2.10
+     */
+    public void setHandleUserInterrupt(boolean enabled)
+    {
+        this.handleUserInterrupt = enabled;
+    }
+
+    /**
+     * Get whether user interrupt handling is enabled
+     *
+     * @return true if enabled; false otherwise
+     * @since 2.10
+     */
+    public boolean getHandleUserInterrupt()
+    {
+        return handleUserInterrupt;
+    }
+
+    /**
+     * Set wether literal next are handled by JLine.
+     *
+     * @since 2.13
+     */
+    public void setHandleLitteralNext(boolean handleLitteralNext) {
+        this.handleLitteralNext = handleLitteralNext;
+    }
+
+    /**
+     * Get wether literal next are handled by JLine.
+     *
+     * @since 2.13
+     */
+    public boolean getHandleLitteralNext() {
+        return handleLitteralNext;
     }
 
     /**
@@ -368,7 +480,7 @@ public class ConsoleReader
 
     public void setPrompt(final String prompt) {
         this.prompt = prompt;
-        this.promptLen = ((prompt == null) ? 0 : stripAnsi(lastLine(prompt)).length());
+        this.promptLen = (prompt == null) ? 0 : wcwidth(Ansi.stripAnsi(lastLine(prompt)), 0);
     }
 
     public String getPrompt() {
@@ -377,24 +489,11 @@ public class ConsoleReader
 
     /**
      * Set the echo character. For example, to have "*" entered when a password is typed:
-     * <p/>
      * <pre>
      * myConsoleReader.setEchoCharacter(new Character('*'));
      * </pre>
-     * <p/>
-     * Setting the character to
-     * <p/>
-     * <pre>
-     * null
-     * </pre>
-     * <p/>
-     * will restore normal character echoing. Setting the character to
-     * <p/>
-     * <pre>
-     * new Character(0)
-     * </pre>
-     * <p/>
-     * will cause nothing to be echoed.
+     * Setting the character to <code>null</code> will restore normal character echoing.<p/>
+     * Setting the character to <code>Character.valueOf(0)</code> will cause nothing to be echoed.
      *
      * @param c the character to echo to the console in place of the typed character.
      */
@@ -419,14 +518,70 @@ public class ConsoleReader
             return false;
         }
 
-        backspaceAll();
+        StringBuilder killed = new StringBuilder();
+
+        while (buf.cursor > 0) {
+            char c = buf.current();
+            if (c == 0) {
+                break;
+            }
+
+            killed.append(c);
+            backspace();
+        }
+
+        String copy = killed.reverse().toString();
+        killRing.addBackwards(copy);
 
         return true;
     }
 
+    int wcwidth(CharSequence str, int pos) {
+        return wcwidth(str, 0, str.length(), pos);
+    }
+
+    int wcwidth(CharSequence str, int start, int end, int pos) {
+        int cur = pos;
+        for (int i = start; i < end;) {
+            int ucs;
+            char c1 = str.charAt(i++);
+            if (!Character.isHighSurrogate(c1) || i >= end) {
+                ucs = c1;
+            } else {
+                char c2 = str.charAt(i);
+                if (Character.isLowSurrogate(c2)) {
+                    i++;
+                    ucs = Character.toCodePoint(c1, c2);
+                } else {
+                    ucs = c1;
+                }
+            }
+            cur += wcwidth(ucs, cur);
+        }
+        return cur - pos;
+    }
+
+    int wcwidth(int ucs, int pos) {
+        if (ucs == '\t') {
+            return nextTabStop(pos);
+        } else if (ucs < 32) {
+            return 2;
+        } else  {
+            int w = WCWidth.wcwidth(ucs);
+            return w > 0 ? w : 0;
+        }
+    }
+
+    int nextTabStop(int pos) {
+        int tabWidth = TAB_WIDTH;
+        int width = getTerminal().getWidth();
+        int mod = (pos + tabWidth - 1) % tabWidth;
+        int npos = pos + tabWidth - mod;
+        return npos < width ? npos - pos : width - pos;
+    }
+
     int getCursorPosition() {
-        // FIXME: does not handle anything but a line with a prompt absolute position
-        return promptLen + buf.cursor;
+        return promptLen + wcwidth(buf.buffer, 0, buf.cursor, promptLen);
     }
 
     /**
@@ -434,7 +589,7 @@ public class ConsoleReader
      * prompt is returned if no '\n' characters are present.
      * null is returned if prompt is null.
      */
-    private String lastLine(String str) {
+    private static String lastLine(String str) {
         if (str == null) return "";
         int last = str.lastIndexOf("\n");
 
@@ -445,23 +600,10 @@ public class ConsoleReader
         return str;
     }
 
-    private String stripAnsi(String str) {
-        if (str == null) return "";
-        try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            AnsiOutputStream aos = new AnsiOutputStream(baos);
-            aos.write(str.getBytes());
-            aos.flush();
-            return baos.toString();
-        } catch (IOException e) {
-            return str;
-        }
-    }
-
     /**
      * Move the cursor position to the specified absolute index.
      */
-    public final boolean setCursorPosition(final int position) throws IOException {
+    public boolean setCursorPosition(final int position) throws IOException {
         if (position == buf.cursor) {
             return true;
         }
@@ -510,20 +652,27 @@ public class ConsoleReader
         setBuffer(String.valueOf(buffer));
     }
 
+    private void setBufferKeepPos(final String buffer) throws IOException {
+        int pos = buf.cursor;
+        setBuffer(buffer);
+        setCursorPosition(pos);
+    }
+
+    private void setBufferKeepPos(final CharSequence buffer) throws IOException {
+        setBufferKeepPos(String.valueOf(buffer));
+    }
+
     /**
      * Output put the prompt + the current buffer
      */
-    public final void drawLine() throws IOException {
+    public void drawLine() throws IOException {
         String prompt = getPrompt();
         if (prompt != null) {
-            print(prompt);
+            rawPrint(prompt);
         }
 
-        print(buf.buffer.toString());
+        print(buf.buffer, 0, buf.cursor, promptLen);
 
-        if (buf.length() != buf.cursor) { // not at end of line
-            back(buf.length() - buf.cursor - 1);
-        }
         // force drawBuffer to check for weird wrap (after clear screen)
         drawBuffer();
     }
@@ -531,9 +680,8 @@ public class ConsoleReader
     /**
      * Clear the line and redraw it.
      */
-    public final void redrawLine() throws IOException {
-        print(RESET_LINE);
-//        flush();
+    public void redrawLine() throws IOException {
+        tputs("carriage_return");
         drawLine();
     }
 
@@ -547,8 +695,18 @@ public class ConsoleReader
         String historyLine = str;
 
         if (expandEvents) {
-            str = expandEvents(str);
-            historyLine = str.replaceAll("\\!", "\\\\!");
+            try {
+                str = expandEvents(str);
+                // all post-expansion occurrences of '!' must have been escaped, so re-add escape to each
+                historyLine = str.replace("!", "\\!");
+                // only leading '^' results in expansion, so only re-add escape for that case
+                historyLine = historyLine.replaceAll("^\\^", "\\\\^");
+            } catch(IllegalArgumentException e) {
+                Log.error("Could not expand event", e);
+                beep();
+                buf.clear();
+                str = "";
+            }
         }
 
         // we only add it to the history if the buffer is not empty
@@ -575,22 +733,25 @@ public class ConsoleReader
      * Expand event designator such as !!, !#, !3, etc...
      * See http://www.gnu.org/software/bash/manual/html_node/Event-Designators.html
      */
+    @SuppressWarnings("fallthrough")
     protected String expandEvents(String str) throws IOException {
         StringBuilder sb = new StringBuilder();
-        boolean escaped = false;
         for (int i = 0; i < str.length(); i++) {
             char c = str.charAt(i);
-            if (escaped) {
-                sb.append(c);
-                escaped = false;
-                continue;
-            } else if (c == '\\') {
-                escaped = true;
-                continue;
-            } else {
-                escaped = false;
-            }
             switch (c) {
+                case '\\':
+                    // any '\!' should be considered an expansion escape, so skip expansion and strip the escape character
+                    // a leading '\^' should be considered an expansion escape, so skip expansion and strip the escape character
+                    // otherwise, add the escape
+                    if (i + 1 < str.length()) {
+                        char nextChar = str.charAt(i+1);
+                        if (nextChar == '!' || (nextChar == '^' && i == 0)) {
+                            c = nextChar;
+                            i++;
+                        }
+                    }
+                    sb.append(c);
+                    break;
                 case '!':
                     if (i + 1 < str.length()) {
                         c = str.charAt(++i);
@@ -619,6 +780,18 @@ public class ConsoleReader
                                     throw new IllegalArgumentException("!?" + sc + ": event not found");
                                 } else {
                                     rep = history.get(idx).toString();
+                                }
+                                break;
+                            case '$':
+                                if (history.size() == 0) {
+                                    throw new IllegalArgumentException("!$: event not found");
+                                }
+                                String previous = history.get(history.index() - 1).toString().trim();
+                                int lastSpace = previous.lastIndexOf(' ');
+                                if(lastSpace != -1) {
+                                    rep = previous.substring(lastSpace+1);
+                                } else {
+                                    rep = previous;
                                 }
                                 break;
                             case ' ':
@@ -654,14 +827,14 @@ public class ConsoleReader
                                     throw new IllegalArgumentException((neg ? "!-" : "!") + str.substring(i1, i) + ": event not found");
                                 }
                                 if (neg) {
-                                    if (idx < history.size()) {
+                                    if (idx > 0 && idx <= history.size()) {
                                         rep = (history.get(history.index() - idx)).toString();
                                     } else {
                                         throw new IllegalArgumentException((neg ? "!-" : "!") + str.substring(i1, i) + ": event not found");
                                     }
                                 } else {
-                                    if (idx >= history.index() - history.size() && idx < history.index()) {
-                                        rep = (history.get(idx)).toString();
+                                    if (idx > history.index() - history.size() && idx <= history.index()) {
+                                        rep = (history.get(idx - 1)).toString();
                                     } else {
                                         throw new IllegalArgumentException((neg ? "!-" : "!") + str.substring(i1, i) + ": event not found");
                                     }
@@ -708,9 +881,6 @@ public class ConsoleReader
                     break;
             }
         }
-        if (escaped) {
-            sb.append('\\');
-        }
         String result = sb.toString();
         if (!str.equals(result)) {
             print(result);
@@ -724,15 +894,16 @@ public class ConsoleReader
     /**
      * Write out the specified string to the buffer and the output stream.
      */
-    public final void putString(final CharSequence str) throws IOException {
+    public void putString(final CharSequence str) throws IOException {
+        int pos = getCursorPosition();
         buf.write(str);
         if (mask == null) {
             // no masking
-            print(str);
+            print(str, pos);
         } else if (mask == NULL_MASK) {
             // don't print anything
         } else {
-            print(mask, str.length());
+            rawPrint(mask, str.length());
         }
         drawBuffer();
     }
@@ -745,48 +916,34 @@ public class ConsoleReader
      */
     private void drawBuffer(final int clear) throws IOException {
         // debug ("drawBuffer: " + clear);
-        if (buf.cursor == buf.length() && clear == 0) {
-        } else {
-            char[] chars = buf.buffer.substring(buf.cursor).toCharArray();
+        int nbChars = buf.length() - buf.cursor;
+        if (buf.cursor != buf.length() || clear != 0) {
             if (mask != null) {
-                Arrays.fill(chars, mask);
-            }
-            if (terminal.hasWeirdWrap()) {
-                // need to determine if wrapping will occur:
-                int width = terminal.getWidth();
-                int pos = getCursorPosition();
-                for (int i = 0; i < chars.length; i++) {
-                    print(chars[i]);
-                    if ((pos + i + 1) % width == 0) {
-                        print(32); // move cursor to next line by printing dummy space
-                        print(13); // CR / not newline.
-                    }
+                if (mask != NULL_MASK) {
+                    rawPrint(mask, nbChars);
+                } else {
+                    nbChars = 0;
                 }
             } else {
-                print(chars);
-            }
-            clearAhead(clear, chars.length);
-            if (terminal.isAnsiSupported()) {
-                if (chars.length > 0) {
-                    back(chars.length);
-                }
-            } else {
-                back(chars.length);
+                print(buf.buffer, buf.cursor, buf.length());
             }
         }
-        if (terminal.hasWeirdWrap()) {
+        int cursorPos = promptLen + wcwidth(buf.buffer, 0, buf.length(), promptLen);
+        if (terminal.hasWeirdWrap() && !cursorOk) {
             int width = terminal.getWidth();
             // best guess on whether the cursor is in that weird location...
             // Need to do this without calling ansi cursor location methods
             // otherwise it breaks paste of wrapped lines in xterm.
-            if (getCursorPosition() > 0 && (getCursorPosition() % width == 0)
-                    && buf.cursor == buf.length() && clear == 0) {
+            if (cursorPos > 0 && (cursorPos % width == 0)) {
                 // the following workaround is reverse-engineered from looking
                 // at what bash sent to the terminal in the same situation
-                print(32); // move cursor to next line by printing dummy space
-                print(13); // CR / not newline.
+                rawPrint(' '); // move cursor to next line by printing dummy space
+                tputs("carriage_return"); // CR / not newline.
             }
+            cursorOk = true;
         }
+        clearAhead(clear, cursorPos);
+        back(nbChars);
     }
 
     /**
@@ -801,70 +958,69 @@ public class ConsoleReader
      * Clear ahead the specified number of characters without moving the cursor.
      *
      * @param num the number of characters to clear
-     * @param delta the difference between the internal cursor and the screen
-     * cursor - if > 0, assume some stuff was printed and weird wrap has to be
-     * checked
+     * @param pos the current screen cursor position
      */
-    private void clearAhead(final int num, int delta) throws IOException {
-        if (num == 0) {
-            return;
-        }
+    private void clearAhead(int num, final int pos) throws IOException {
+        if (num == 0) return;
 
-        if (terminal.isAnsiSupported()) {
-            int width = terminal.getWidth();
-            int screenCursorCol = getCursorPosition() + delta;
-            // clear current line
-            printAnsiSequence("K");
-            // if cursor+num wraps, then we need to clear the line(s) below too
-            int curCol = screenCursorCol % width;
-            int endCol = (screenCursorCol + num - 1) % width;
-            int lines = num / width;
-            if (endCol < curCol) lines++;
-            for (int i = 0; i < lines; i++) {
-                printAnsiSequence("B");
-                printAnsiSequence("2K");
+        int width = terminal.getWidth();
+        // Use kill line
+        if (terminal.getStringCapability("clr_eol") != null) {
+            int cur = pos;
+            int c0 = cur % width;
+            // Erase end of current line
+            int nb = Math.min(num, width - c0);
+            tputs("clr_eol");
+            num -= nb;
+            // Loop
+            while (num > 0) {
+                // Move to beginning of next line
+                int prev = cur;
+                cur = cur - cur % width + width;
+                moveCursorFromTo(prev, cur);
+                // Erase
+                nb = Math.min(num, width);
+                tputs("clr_eol");
+                num -= nb;
             }
-            for (int i = 0; i < lines; i++) {
-                printAnsiSequence("A");
-            }
-            return;
+            moveCursorFromTo(cur, pos);
         }
-
-        // print blank extra characters
-        print(' ', num);
-
-        // we need to flush here so a "clever" console doesn't just ignore the redundancy
-        // of a space followed by a backspace.
-//        flush();
-
-        // reset the visual cursor
-        back(num);
-
-//        flush();
+        // Terminal does not wrap on the right margin
+        else if (!terminal.getBooleanCapability("auto_right_margin")) {
+            int cur = pos;
+            int c0 = cur % width;
+            // Erase end of current line
+            int nb = Math.min(num, width - c0);
+            rawPrint(' ', nb);
+            num -= nb;
+            cur += nb;
+            // Loop
+            while (num > 0) {
+                // Move to beginning of next line
+                moveCursorFromTo(cur, ++cur);
+                // Erase
+                nb = Math.min(num, width);
+                rawPrint(' ', nb);
+                num -= nb;
+                cur += nb;
+            }
+            moveCursorFromTo(cur, pos);
+        }
+        // Simple erasure
+        else {
+            rawPrint(' ', num);
+            moveCursorFromTo(pos + num, pos);
+        }
     }
 
     /**
-     * Move the visual cursor backwards without modifying the buffer cursor.
+     * Move the visual cursor backward without modifying the buffer cursor.
      */
     protected void back(final int num) throws IOException {
         if (num == 0) return;
-        if (terminal.isAnsiSupported()) {
-            int width = getTerminal().getWidth();
-            int cursor = getCursorPosition();
-            int realCursor = cursor + num;
-            int realCol  = realCursor % width;
-            int newCol = cursor % width;
-            int moveup = num / width;
-            int delta = realCol - newCol;
-            if (delta < 0) moveup++;
-            if (moveup > 0) {
-                printAnsiSequence(moveup + "A");
-            }
-            printAnsiSequence((1 + newCol) + "G");
-            return;
-        }
-        print(BACKSPACE, num);
-//        flush();
+        int i0 = promptLen + wcwidth(buf.buffer, 0, buf.cursor, promptLen);
+        int i1 = i0 + ((mask != null) ? num : wcwidth(buf.buffer, buf.cursor, buf.cursor + num, i0));
+        moveCursorFromTo(i1, i0);
     }
 
     /**
@@ -889,37 +1045,11 @@ public class ConsoleReader
             return 0;
         }
 
-        int count = 0;
-
-        int termwidth = getTerminal().getWidth();
-        int lines = getCursorPosition() / termwidth;
-        count = moveCursor(-1 * num) * -1;
+        int count = - moveCursor(-num);
+        int clear = wcwidth(buf.buffer, buf.cursor, buf.cursor + count, getCursorPosition());
         buf.buffer.delete(buf.cursor, buf.cursor + count);
-        if (getCursorPosition() / termwidth != lines) {
-            if (terminal.isAnsiSupported()) {
-                // debug("doing backspace redraw: " + getCursorPosition() + " on " + termwidth + ": " + lines);
-                printAnsiSequence("K");
-                // if cursor+num wraps, then we need to clear the line(s) below too
-                // last char printed is one pos less than cursor so we subtract
-                // one
-/*
-                // TODO: fixme (does not work - test with reverse search with wrapping line and CTRL-E)
-                int endCol = (getCursorPosition() + num - 1) % termwidth;
-                int curCol = getCursorPosition() % termwidth;
-                if (endCol < curCol) lines++;
-                for (int i = 1; i < lines; i++) {
-                    printAnsiSequence("B");
-                    printAnsiSequence("2K");
-                }
-                for (int i = 1; i < lines; i++) {
-                    printAnsiSequence("A");
-                }
-                return count;
-*/
-            }
-        }
-        drawBuffer(count);
 
+        drawBuffer(clear);
         return count;
     }
 
@@ -969,7 +1099,7 @@ public class ConsoleReader
             case FORWARD_CHAR:
             case END_OF_LINE:
             case VI_MATCH:
-            case VI_BEGNNING_OF_LINE_OR_ARG_DIGIT:
+            case VI_BEGINNING_OF_LINE_OR_ARG_DIGIT:
             case VI_ARG_DIGIT:
             case VI_PREV_WORD:
             case VI_END_WORD:
@@ -992,7 +1122,6 @@ public class ConsoleReader
      * Deletes the previous character from the cursor position
      * @param count number of times to do it.
      * @return true if it was done.
-     * @throws IOException
      */
     private boolean viRubout(int count) throws IOException {
         boolean ok = true;
@@ -1007,7 +1136,6 @@ public class ConsoleReader
      * the line in from the right.
      * @param count Number of times to perform the operation.
      * @return true if its works, false if it didn't
-     * @throws IOException
      */
     private boolean viDelete(int count) throws IOException {
         boolean ok = true;
@@ -1024,7 +1152,6 @@ public class ConsoleReader
      * @param count The number of times to repeat
      * @return true if it completed successfully, false if not all
      *   case changes could be completed.
-     * @throws IOException
      */
     private boolean viChangeCase(int count) throws IOException {
         boolean ok = true;
@@ -1053,7 +1180,6 @@ public class ConsoleReader
      * @param count Number of times to perform the action
      * @param c The character to change to
      * @return Whether or not there were problems encountered
-     * @throws IOException
      */
     private boolean viChangeChar(int count, int c) throws IOException {
         // EOF, ESC, or CTRL-C aborts.
@@ -1083,7 +1209,6 @@ public class ConsoleReader
      *
      * @param count number of iterations
      * @return true if the move was successful, false otherwise
-     * @throws IOException
      */
     private boolean viPreviousWord(int count) throws IOException {
         boolean ok = true;
@@ -1115,10 +1240,12 @@ public class ConsoleReader
      * span of the input line.
      * @param startPos The start position
      * @param endPos The end position.
+     * @param isChange If true, then the delete is part of a change operationg
+     *    (e.g. "c$" is change-to-end-of line, so we first must delete to end 
+     *    of line to start the change
      * @return true if it succeeded, false otherwise
-     * @throws IOException
      */
-    private boolean viDeleteTo(int startPos, int endPos) throws IOException {
+    private boolean viDeleteTo(int startPos, int endPos, boolean isChange) throws IOException {
         if (startPos == endPos) {
             return true;
         }
@@ -1133,6 +1260,15 @@ public class ConsoleReader
         buf.cursor = startPos;
         buf.buffer.delete(startPos, endPos);
         drawBuffer(endPos - startPos);
+        
+        // If we are doing a delete operation (e.g. "d$") then don't leave the
+        // cursor dangling off the end. In reality the "isChange" flag is silly
+        // what is really happening is that if we are in "move-mode" then the
+        // cursor can't be moved off the end of the line, but in "edit-mode" it
+        // is ok, but I have no easy way of knowing which mode we are in.
+        if (! isChange && startPos > 0 && startPos == buf.length()) {
+            moveCursor(-1);
+        }
         return true;
     }
 
@@ -1144,7 +1280,6 @@ public class ConsoleReader
      * @param startPos The starting position from which to yank
      * @param endPos The ending position to which to yank
      * @return true if the yank succeeded
-     * @throws IOException
      */
     private boolean viYankTo(int startPos, int endPos) throws IOException {
         int cursorPos = startPos;
@@ -1176,7 +1311,6 @@ public class ConsoleReader
      *
      * @param count Number of times to perform the operation.
      * @return true if it worked, false otherwise
-     * @throws IOException
      */
     private boolean viPut(int count) throws IOException {
         if (yankBuffer.length () == 0) {
@@ -1198,7 +1332,6 @@ public class ConsoleReader
      * @param count Number of times to repeat the process.
      * @param ch The character to search for
      * @return true if the char was found, false otherwise
-     * @throws IOException
      */
     private boolean viCharSearch(int count, int invokeChar, int ch) throws IOException {
         if (ch < 0 || invokeChar < 0) {
@@ -1254,7 +1387,7 @@ public class ConsoleReader
             while (count-- > 0) {
                 int pos = buf.cursor + 1;
                 while (pos < buf.buffer.length()) {
-                    if (buf.buffer.charAt(pos) == (char) searchChar) {
+                    if (buf.buffer.charAt(pos) == searchChar) {
                         setCursorPosition(pos);
                         ok = true;
                         break;
@@ -1282,7 +1415,7 @@ public class ConsoleReader
             while (count-- > 0) {
                 int pos = buf.cursor - 1;
                 while (pos >= 0) {
-                    if (buf.buffer.charAt(pos) == (char) searchChar) {
+                    if (buf.buffer.charAt(pos) == searchChar) {
                         setCursorPosition(pos);
                         ok = true;
                         break;
@@ -1298,7 +1431,7 @@ public class ConsoleReader
         return ok;
     }
 
-    private char switchCase(char ch) {
+    private static char switchCase(char ch) {
         if (Character.isUpperCase(ch)) {
             return Character.toLowerCase(ch);
         }
@@ -1322,7 +1455,6 @@ public class ConsoleReader
      *
      * @param count number of iterations
      * @return true if the move was successful, false otherwise
-     * @throws IOException
      */
     private boolean viNextWord(int count) throws IOException {
         int pos = buf.cursor;
@@ -1360,7 +1492,6 @@ public class ConsoleReader
      *
      * @param count Number of times to repeat the action
      * @return true if it worked.
-     * @throws IOException
      */
     private boolean viEndWord(int count) throws IOException {
         int pos = buf.cursor;
@@ -1418,26 +1549,46 @@ public class ConsoleReader
      *
      * @param count Number of times to perform the operation
      * @return true if it worked, false if you tried to delete too many words
-     * @throws IOException
      */
     private boolean unixWordRubout(int count) throws IOException {
-        for (; count > 0; --count) {
-            if (buf.cursor == 0)
-                return false;
+        boolean success = true;
+        StringBuilder killed = new StringBuilder();
 
-            while (isWhitespace(buf.current()) && backspace()) {
-                // nothing
+        for (; count > 0; --count) {
+            if (buf.cursor == 0) {
+                success = false;
+                break;
             }
-            while (!isWhitespace(buf.current()) && backspace()) {
-                // nothing
+
+            while (isWhitespace(buf.current())) {
+                char c = buf.current();
+                if (c == 0) {
+                    break;
+                }
+
+                killed.append(c);
+                backspace();
+            }
+
+            while (!isWhitespace(buf.current())) {
+                char c = buf.current();
+                if (c == 0) {
+                    break;
+                }
+
+                killed.append(c);
+                backspace();
             }
         }
 
-        return true;
+        String copy = killed.reverse().toString();
+        killRing.addBackwards(copy);
+
+        return success;
     }
 
     private String insertComment(boolean isViMode) throws IOException {
-        String comment = this.getCommentBegin ();
+        String comment = this.getCommentBegin();
         setCursorPosition(0);
         putString(comment);
         if (isViMode) {
@@ -1447,35 +1598,9 @@ public class ConsoleReader
     }
 
     /**
-     * Similar to putString() but allows the string to be repeated a specific
-     * number of times, allowing easy support of vi digit arguments to a given
-     * command. The string is placed as the current cursor position.
-     *
-     * @param count The count of times to insert the string.
-     * @param str The string to insert
-     * @return true if the operation is a success, false otherwise
-     * @throws IOException
-     */
-    private boolean insert(int count, final CharSequence str) throws IOException {
-        for (int i = 0; i < count; i++) {
-            buf.write(str);
-            if (mask == null) {
-                // no masking
-                print(str);
-            } else if (mask == NULL_MASK) {
-                // don't print anything
-            } else {
-                print(mask, str.length());
-            }
-        }
-        drawBuffer();
-        return true;
-    }
-
-    /**
      * Implements vi search ("/" or "?").
-     * @throws IOException
      */
+    @SuppressWarnings("fallthrough")
     private int viSearch(char searchChar) throws IOException {
         boolean isForward = (searchChar == '/');
 
@@ -1648,18 +1773,19 @@ public class ConsoleReader
     }
 
     private void insertClose(String s) throws IOException {
-         putString(s);
-         int closePosition = buf.cursor;
+        putString(s);
+        int closePosition = buf.cursor;
 
-         moveCursor(-1);
-         viMatch();
+        moveCursor(-1);
+        viMatch();
 
 
-         if (in.isNonBlockingEnabled()) {
+        if (in.isNonBlockingEnabled()) {
             in.peek(parenBlinkTimeout);
-         }
+        }
 
-         setCursorPosition(closePosition);
+        setCursorPosition(closePosition);
+        flush();
     }
 
     /**
@@ -1668,7 +1794,6 @@ public class ConsoleReader
      * The logic works like so:
      * @return true if it worked, false if the cursor was not on a bracket
      *   character or if there was no matching bracket.
-     * @throws IOException
      */
     private boolean viMatch() throws IOException {
         int pos        = buf.cursor;
@@ -1709,6 +1834,7 @@ public class ConsoleReader
             ++pos;
 
         setCursorPosition(pos);
+        flush();
         return true;
     }
 
@@ -1719,7 +1845,7 @@ public class ConsoleReader
      * @return 1 is square, 2 curly, 3 parent, or zero for none.  The value
      *   will be negated if it is the closing form of the bracket.
      */
-    private int getBracketType (char ch) {
+    private static int getBracketType (char ch) {
         switch (ch) {
             case '[': return  1;
             case ']': return -1;
@@ -1733,25 +1859,54 @@ public class ConsoleReader
     }
 
     private boolean deletePreviousWord() throws IOException {
-        while (isDelimiter(buf.current()) && backspace()) {
-            // nothing
+        StringBuilder killed = new StringBuilder();
+        char c;
+
+        while (isDelimiter((c = buf.current()))) {
+            if (c == 0) {
+                break;
+            }
+
+            killed.append(c);
+            backspace();
         }
 
-        while (!isDelimiter(buf.current()) && backspace()) {
-            // nothing
+        while (!isDelimiter((c = buf.current()))) {
+            if (c == 0) {
+                break;
+            }
+
+            killed.append(c);
+            backspace();
         }
 
+        String copy = killed.reverse().toString();
+        killRing.addBackwards(copy);
         return true;
     }
 
     private boolean deleteNextWord() throws IOException {
-        while (isDelimiter(buf.nextChar()) && delete()) {
+        StringBuilder killed = new StringBuilder();
+        char c;
 
+        while (isDelimiter((c = buf.nextChar()))) {
+            if (c == 0) {
+                break;
+            }
+            killed.append(c);
+            delete();
         }
 
-        while (!isDelimiter(buf.nextChar()) && delete()) {
-            // nothing
+        while (!isDelimiter((c = buf.nextChar()))) {
+            if (c == 0) {
+                break;
+            }
+            killed.append(c);
+            delete();
         }
+
+        String copy = killed.toString();
+        killRing.add(copy);
 
         return true;
     }
@@ -1802,7 +1957,6 @@ public class ConsoleReader
      * @param count The number of times to perform the transpose
      * @return true if the operation succeeded, false otherwise (e.g. transpose
      *   cannot happen at the beginning of the line).
-     * @throws IOException
      */
     private boolean transposeChars(int count) throws IOException {
         for (; count > 0; --count) {
@@ -1847,13 +2001,19 @@ public class ConsoleReader
      * complete and is returned.
      *
      * @return The completed line of text.
-     * @throws IOException
      */
     public String accept() throws IOException {
         moveToEnd();
         println(); // output newline
         flush();
         return finishBuffer();
+    }
+
+    private void abort() throws IOException {
+        beep();
+        buf.clear();
+        println();
+        redrawLine();
     }
 
     /**
@@ -1895,75 +2055,65 @@ public class ConsoleReader
         // + buf.cursor + " => " + (buf.cursor + where) + ")");
         buf.cursor += where;
 
-        if (terminal.isAnsiSupported()) {
+        int i0;
+        int i1;
+        if (mask == null) {
             if (where < 0) {
-                back(Math.abs(where));
+                i1 = promptLen + wcwidth(buf.buffer, 0, buf.cursor, promptLen);
+                i0 = i1 + wcwidth(buf.buffer, buf.cursor, buf.cursor - where, i1);
             } else {
-                int width = getTerminal().getWidth();
-                int cursor = getCursorPosition();
-                int oldLine = (cursor - where) / width;
-                int newLine = cursor / width;
-                if (newLine > oldLine) {
-                    printAnsiSequence((newLine - oldLine) + "B");
-                }
-                printAnsiSequence(1 +(cursor % width) + "G");
+                i0 = promptLen + wcwidth(buf.buffer, 0, buf.cursor - where, promptLen);
+                i1 = i0 + wcwidth(buf.buffer, buf.cursor - where, buf.cursor, i0);
             }
-//            flush();
+        } else if (mask != NULL_MASK) {
+            i1 = promptLen + buf.cursor;
+            i0 = i1 - where;
+        } else {
             return;
         }
-
-        char c;
-
-        if (where < 0) {
-            int len = 0;
-            for (int i = buf.cursor; i < buf.cursor - where; i++) {
-                if (buf.buffer.charAt(i) == '\t') {
-                    len += TAB_WIDTH;
-                }
-                else {
-                    len++;
-                }
-            }
-
-            char chars[] = new char[len];
-            Arrays.fill(chars, BACKSPACE);
-            out.write(chars);
-
-            return;
-        }
-        else if (buf.cursor == 0) {
-            return;
-        }
-        else if (mask != null) {
-            c = mask;
-        }
-        else {
-            print(buf.buffer.substring(buf.cursor - where, buf.cursor).toCharArray());
-            return;
-        }
-
-        // null character mask: don't output anything
-        if (mask == NULL_MASK) {
-            return;
-        }
-
-        print(c, Math.abs(where));
+        moveCursorFromTo(i0, i1);
     }
 
-    // FIXME: replace() is not used
-
-    public final boolean replace(final int num, final String replacement) {
-        buf.buffer.replace(buf.cursor - num, buf.cursor, replacement);
-        try {
-            moveCursor(-num);
-            drawBuffer(Math.max(0, num - replacement.length()));
-            moveCursor(replacement.length());
+    private void moveCursorFromTo(int i0, int i1) throws IOException {
+        if (i0 == i1) return;
+        int width = getTerminal().getWidth();
+        int l0 = i0 / width;
+        int c0 = i0 % width;
+        int l1 = i1 / width;
+        int c1 = i1 % width;
+        if (l0 == l1 + 1) {
+            if (!tputs("cursor_up")) {
+                tputs("parm_up_cursor", 1);
+            }
+        } else if (l0 > l1) {
+            if (!tputs("parm_up_cursor", l0 - l1)) {
+                for (int i = l1; i < l0; i++) {
+                    tputs("cursor_up");
+                }
+            }
+        } else if (l0 < l1) {
+            tputs("carriage_return");
+            rawPrint('\n', l1 - l0);
+            c0 = 0;
         }
-        catch (IOException e) {
-            e.printStackTrace();
-            return false;
+        if (c0 == c1 - 1) {
+            tputs("cursor_right");
+        } else if (c0 == c1 + 1) {
+            tputs("cursor_left");
+        } else if (c0 < c1) {
+            if (!tputs("parm_right_cursor", c1 - c0)) {
+                for (int i = c0; i < c1; i++) {
+                    tputs("cursor_right");
+                }
+            }
+        } else if (c0 > c1) {
+            if (!tputs("parm_left_cursor", c0 - c1)) {
+                for (int i = c1; i < c0; i++) {
+                    tputs("cursor_left");
+                }
+            }
         }
-        return true;
+        cursorOk = true;
     }
 
     /**
@@ -1971,13 +2121,37 @@ public class ConsoleReader
      *
      * @return the character, or -1 if an EOF is received.
      */
-    public final int readCharacter() throws IOException {
+    public int readCharacter() throws IOException {
+      return readCharacter(false);
+    }
+
+    /**
+     * Read a character from the console.  If boolean parameter is "true", it will check whether the keystroke was an "alt-" key combination, and
+     * if so add 1000 to the value returned.  Better way...?
+     *
+     * @return the character, or -1 if an EOF is received.
+     */
+    public int readCharacter(boolean checkForAltKeyCombo) throws IOException {
         int c = reader.read();
         if (c >= 0) {
             Log.trace("Keystroke: ", c);
             // clear any echo characters
             if (terminal.isSupported()) {
                 clearEcho(c);
+            }
+            if (c == ESCAPE && checkForAltKeyCombo && in.peek(escapeTimeout) >= 32) {
+              /* When ESC is encountered and there is a pending
+               * character in the pushback queue, then it seems to be
+               * an Alt-[key] combination.  Is this true, cross-platform?
+               * It's working for me on Debian GNU/Linux at the moment anyway.
+               * I removed the "isNonBlockingEnabled" check, though it was
+               * in the similar code in "readLine(String prompt, final Character mask)" (way down),
+               * as I am not sure / didn't look up what it's about, and things are working so far w/o it.
+               */
+              int next = reader.read();
+              // with research, there's probably a much cleaner way to do this, but, this is now it flags an Alt key combination for now:
+              next = next + 1000;
+              return next;
             }
         }
         return c;
@@ -1993,81 +2167,158 @@ public class ConsoleReader
         }
 
         // otherwise, clear
-        int num = countEchoCharacters(c);
-        back(num);
+        int pos = getCursorPosition();
+        int num = wcwidth(c, pos);
+        moveCursorFromTo(pos + num, pos);
         drawBuffer(num);
 
         return num;
     }
 
-    private int countEchoCharacters(final int c) {
-        // tabs as special: we need to determine the number of spaces
-        // to cancel based on what out current cursor position is
-        if (c == 9) {
-            int tabStop = 8; // will this ever be different?
-            int position = getCursorPosition();
-
-            return tabStop - (position % tabStop);
-        }
-
-        return getPrintableCharacters(c).length();
+    public int readCharacter(final char... allowed) throws IOException {
+      return readCharacter(false, allowed);
     }
 
-    /**
-     * Return the number of characters that will be printed when the specified
-     * character is echoed to the screen
-     *
-     * Adapted from cat by Torbjorn Granlund, as repeated in stty by David MacKenzie.
-     */
-    private StringBuilder getPrintableCharacters(final int ch) {
-        StringBuilder sbuff = new StringBuilder();
-
-        if (ch >= 32) {
-            if (ch < 127) {
-                sbuff.append(ch);
-            }
-            else if (ch == 127) {
-                sbuff.append('^');
-                sbuff.append('?');
-            }
-            else {
-                sbuff.append('M');
-                sbuff.append('-');
-
-                if (ch >= (128 + 32)) {
-                    if (ch < (128 + 127)) {
-                        sbuff.append((char) (ch - 128));
-                    }
-                    else {
-                        sbuff.append('^');
-                        sbuff.append('?');
-                    }
-                }
-                else {
-                    sbuff.append('^');
-                    sbuff.append((char) (ch - 128 + 64));
-                }
-            }
-        }
-        else {
-            sbuff.append('^');
-            sbuff.append((char) (ch + 64));
-        }
-
-        return sbuff;
-    }
-
-    public final int readCharacter(final char... allowed) throws IOException {
+    public int readCharacter(boolean checkForAltKeyCombo, final char... allowed) throws IOException {
         // if we restrict to a limited set and the current character is not in the set, then try again.
         char c;
 
         Arrays.sort(allowed); // always need to sort before binarySearch
 
-        while (Arrays.binarySearch(allowed, c = (char) readCharacter()) < 0) {
+        while (Arrays.binarySearch(allowed, c = (char) readCharacter(checkForAltKeyCombo)) < 0) {
             // nothing
         }
 
         return c;
+    }
+
+    /**
+     * Read from the input stream and decode an operation from the key map.
+     *
+     * The input stream will be read character by character until a matching
+     * binding can be found.  Characters that can't possibly be matched to
+     * any binding will be discarded.
+     *
+     * @param keys the KeyMap to use for decoding the input stream
+     * @return the decoded binding or <code>null</code> if the end of
+     *         stream has been reached
+     */
+    public Object readBinding(KeyMap keys) throws IOException {
+        Object o;
+        opBuffer.setLength(0);
+        do {
+            int c = pushBackChar.isEmpty() ? readCharacter() : pushBackChar.pop();
+            if (c == -1) {
+                return null;
+            }
+            opBuffer.appendCodePoint(c);
+
+            if (recording) {
+                macro += new String(Character.toChars(c));
+            }
+
+            if (quotedInsert) {
+                o = Operation.SELF_INSERT;
+                quotedInsert = false;
+            } else {
+                o = keys.getBound(opBuffer);
+            }
+
+            /*
+             * The kill ring keeps record of whether or not the
+             * previous command was a yank or a kill. We reset
+             * that state here if needed.
+             */
+            if (!recording && !(o instanceof KeyMap)) {
+                if (o != Operation.YANK_POP && o != Operation.YANK) {
+                    killRing.resetLastYank();
+                }
+                if (o != Operation.KILL_LINE && o != Operation.KILL_WHOLE_LINE
+                        && o != Operation.BACKWARD_KILL_WORD && o != Operation.KILL_WORD
+                        && o != Operation.UNIX_LINE_DISCARD && o != Operation.UNIX_WORD_RUBOUT) {
+                    killRing.resetLastKill();
+                }
+            }
+
+            if (o == Operation.DO_LOWERCASE_VERSION) {
+                opBuffer.setLength(opBuffer.length() - 1);
+                opBuffer.append(Character.toLowerCase((char) c));
+                o = keys.getBound(opBuffer);
+            }
+
+            /*
+             * A KeyMap indicates that the key that was struck has a
+             * number of keys that can follow it as indicated in the
+             * map. This is used primarily for Emacs style ESC-META-x
+             * lookups. Since more keys must follow, go back to waiting
+             * for the next key.
+             */
+            if (o instanceof KeyMap) {
+                /*
+                 * The ESC key (#27) is special in that it is ambiguous until
+                 * you know what is coming next.  The ESC could be a literal
+                 * escape, like the user entering vi-move mode, or it could
+                 * be part of a terminal control sequence.  The following
+                 * logic attempts to disambiguate things in the same
+                 * fashion as regular vi or readline.
+                 *
+                 * When ESC is encountered and there is no other pending
+                 * character in the pushback queue, then attempt to peek
+                 * into the input stream (if the feature is enabled) for
+                 * 150ms. If nothing else is coming, then assume it is
+                 * not a terminal control sequence, but a raw escape.
+                 */
+                if (c == ESCAPE
+                        && pushBackChar.isEmpty()
+                        && in.isNonBlockingEnabled()
+                        && in.peek(escapeTimeout) == READ_EXPIRED) {
+                    o = ((KeyMap) o).getAnotherKey();
+                    if (o == null || o instanceof KeyMap) {
+                        continue;
+                    }
+                    opBuffer.setLength(0);
+                } else {
+                    continue;
+                }
+            }
+
+            /*
+             * If we didn't find a binding for the key and there is
+             * more than one character accumulated then start checking
+             * the largest span of characters from the beginning to
+             * see if there is a binding for them.
+             *
+             * For example if our buffer has ESC,CTRL-M,C the getBound()
+             * called previously indicated that there is no binding for
+             * this sequence, so this then checks ESC,CTRL-M, and failing
+             * that, just ESC. Each keystroke that is pealed off the end
+             * during these tests is stuffed onto the pushback buffer so
+             * they won't be lost.
+             *
+             * If there is no binding found, then we go back to waiting for
+             * input.
+             */
+            while (o == null && opBuffer.length() > 0) {
+                c = opBuffer.charAt(opBuffer.length() - 1);
+                opBuffer.setLength(opBuffer.length() - 1);
+                Object o2 = keys.getBound(opBuffer);
+                if (o2 instanceof KeyMap) {
+                    o = ((KeyMap) o2).getAnotherKey();
+                    if (o == null) {
+                        continue;
+                    } else {
+                        pushBackChar.push((char) c);
+                    }
+                }
+            }
+
+        } while (o == null || o instanceof KeyMap);
+
+        return o;
+    }
+
+    public String getLastBinding() {
+        return opBuffer.toString();
     }
 
     //
@@ -2100,6 +2351,18 @@ public class ConsoleReader
     }
 
     /**
+     * Read a line from the <i>in</i> {@link InputStream}, and return the line
+     * (without any trailing newlines).
+     *
+     * @param prompt    The prompt to issue to the console, may be null.
+     * @return          A line that is read from the terminal, or null if there was null input (e.g., <i>CTRL-D</i>
+     *                  was pressed).
+     */
+    public String readLine(String prompt, final Character mask) throws IOException {
+        return readLine(prompt, mask, null);
+    }
+
+    /**
      * Sets the current keymap by name. Supported keymaps are "emacs",
      * "vi-insert", "vi-move".
      * @param name The name of the keymap to switch to
@@ -2128,9 +2391,10 @@ public class ConsoleReader
      * @return          A line that is read from the terminal, or null if there was null input (e.g., <i>CTRL-D</i>
      *                  was pressed).
      */
-    public String readLine(String prompt, final Character mask) throws IOException {
+    public String readLine(String prompt, final Character mask, String buffer) throws IOException {
         // prompt may be null
         // mask may be null
+        // buffer may be null
 
         /*
          * This is the accumulator for VI-mode repeat count. That is, while in
@@ -2140,7 +2404,7 @@ public class ConsoleReader
         int repeatCount = 0;
 
         // FIXME: This blows, each call to readLine will reset the console's state which doesn't seem very nice.
-        this.mask = mask;
+        this.mask = mask != null ? mask : this.echoCharacter;
         if (prompt != null) {
             setPrompt(prompt);
         }
@@ -2149,12 +2413,17 @@ public class ConsoleReader
         }
 
         try {
+            if (buffer != null) {
+                buf.write(buffer);
+            }
+
             if (!terminal.isSupported()) {
                 beforeReadLine(prompt, mask);
             }
 
-            if (prompt != null && prompt.length() > 0) {
-                out.write(prompt);
+            if (buffer != null && buffer.length() > 0
+                    || prompt != null && prompt.length() > 0) {
+                drawLine();
                 out.flush();
             }
 
@@ -2163,101 +2432,29 @@ public class ConsoleReader
                 return readLineSimple();
             }
 
+            if (handleUserInterrupt && (terminal instanceof UnixTerminal)) {
+                ((UnixTerminal) terminal).disableInterruptCharacter();
+            }
+            if (handleLitteralNext && (terminal instanceof UnixTerminal)) {
+                ((UnixTerminal) terminal).disableLitteralNextCharacter();
+            }
+
             String originalPrompt = this.prompt;
 
             state = State.NORMAL;
 
             boolean success = true;
 
-            StringBuilder sb = new StringBuilder();
-            Stack<Character> pushBackChar = new Stack<Character>();
+            pushBackChar.clear();
             while (true) {
-                int c = pushBackChar.isEmpty() ? readCharacter() : pushBackChar.pop ();
-                if (c == -1) {
+
+                Object o = readBinding(getKeys());
+                if (o == null) {
                     return null;
                 }
-                sb.append( (char) c );
-
-                if (recording) {
-                    macro += (char) c;
-                }
-
-                Object o = getKeys().getBound( sb );
-                if (o == Operation.DO_LOWERCASE_VERSION) {
-                    sb.setLength( sb.length() - 1);
-                    sb.append( Character.toLowerCase( (char) c ));
-                    o = getKeys().getBound( sb );
-                }
-
-                /*
-                 * A KeyMap indicates that the key that was struck has a
-                 * number of keys that can follow it as indicated in the
-                 * map. This is used primarily for Emacs style ESC-META-x
-                 * lookups. Since more keys must follow, go back to waiting
-                 * for the next key.
-                 */
-                if ( o instanceof KeyMap ) {
-                    /*
-                     * The ESC key (#27) is special in that it is ambiguous until
-                     * you know what is coming next.  The ESC could be a literal
-                     * escape, like the user entering vi-move mode, or it could
-                     * be part of a terminal control sequence.  The following
-                     * logic attempts to disambiguate things in the same
-                     * fashion as regular vi or readline.
-                     *
-                     * When ESC is encountered and there is no other pending
-                     * character in the pushback queue, then attempt to peek
-                     * into the input stream (if the feature is enabled) for
-                     * 150ms. If nothing else is coming, then assume it is
-                     * not a terminal control sequence, but a raw escape.
-                     */
-                    if (c == 27
-                            && pushBackChar.isEmpty()
-                            && in.isNonBlockingEnabled()
-                            && in.peek(escapeTimeout) == -2) {
-                        o = ((KeyMap) o).getAnotherKey();
-                        if (o == null || o instanceof KeyMap) {
-                            continue;
-                        }
-                        sb.setLength(0);
-                    }
-                    else {
-                        continue;
-                    }
-                }
-
-                /*
-                 * If we didn't find a binding for the key and there is
-                 * more than one character accumulated then start checking
-                 * the largest span of characters from the beginning to
-                 * see if there is a binding for them.
-                 *
-                 * For example if our buffer has ESC,CTRL-M,C the getBound()
-                 * called previously indicated that there is no binding for
-                 * this sequence, so this then checks ESC,CTRL-M, and failing
-                 * that, just ESC. Each keystroke that is pealed off the end
-                 * during these tests is stuffed onto the pushback buffer so
-                 * they won't be lost.
-                 *
-                 * If there is no binding found, then we go back to waiting for
-                 * input.
-                 */
-                while ( o == null && sb.length() > 0 ) {
-                    c = sb.charAt( sb.length() - 1 );
-                    sb.setLength( sb.length() - 1 );
-                    Object o2 = getKeys().getBound( sb );
-                    if ( o2 instanceof KeyMap ) {
-                        o = ((KeyMap) o2).getAnotherKey();
-                        if ( o == null ) {
-                            continue;
-                        } else {
-                            pushBackChar.push( (char) c );
-                        }
-                    }
-                }
-
-                if ( o == null ) {
-                    continue;
+                int c = 0;
+                if (opBuffer.length() > 0) {
+                    c = opBuffer.codePointBefore(opBuffer.length());
                 }
                 Log.trace("Binding: ", o);
 
@@ -2268,52 +2465,77 @@ public class ConsoleReader
                     for (int i = 0; i < macro.length(); i++) {
                         pushBackChar.push(macro.charAt(macro.length() - 1 - i));
                     }
-                    sb.setLength( 0 );
+                    opBuffer.setLength(0);
                     continue;
                 }
 
                 // Handle custom callbacks
                 if (o instanceof ActionListener) {
                     ((ActionListener) o).actionPerformed(null);
-                    sb.setLength( 0 );
+                    opBuffer.setLength(0);
                     continue;
                 }
+
+                CursorBuffer oldBuf = new CursorBuffer();
+                oldBuf.buffer.append(buf.buffer);
+                oldBuf.cursor = buf.cursor;
 
                 // Search mode.
                 //
                 // Note that we have to do this first, because if there is a command
                 // not linked to a search command, we leave the search mode and fall
                 // through to the normal state.
-                if (state == State.SEARCH) {
+                if (state == State.SEARCH || state == State.FORWARD_SEARCH) {
                     int cursorDest = -1;
+                    // TODO: check the isearch-terminators variable terminating the search
                     switch ( ((Operation) o )) {
                         case ABORT:
                             state = State.NORMAL;
+                            buf.clear();
+                            buf.write(originalBuffer.buffer);
+                            buf.cursor = originalBuffer.cursor;
                             break;
 
                         case REVERSE_SEARCH_HISTORY:
-                        case HISTORY_SEARCH_BACKWARD:
+                            state = State.SEARCH;
                             if (searchTerm.length() == 0) {
                                 searchTerm.append(previousSearchTerm);
                             }
 
-                            if (searchIndex == -1) {
-                                searchIndex = searchBackwards(searchTerm.toString());
-                            } else {
+                            if (searchIndex > 0) {
                                 searchIndex = searchBackwards(searchTerm.toString(), searchIndex);
+                            }
+                            break;
+
+                        case FORWARD_SEARCH_HISTORY:
+                            state = State.FORWARD_SEARCH;
+                            if (searchTerm.length() == 0) {
+                                searchTerm.append(previousSearchTerm);
+                            }
+
+                            if (searchIndex > -1 && searchIndex < history.size() - 1) {
+                                searchIndex = searchForwards(searchTerm.toString(), searchIndex);
                             }
                             break;
 
                         case BACKWARD_DELETE_CHAR:
                             if (searchTerm.length() > 0) {
                                 searchTerm.deleteCharAt(searchTerm.length() - 1);
-                                searchIndex = searchBackwards(searchTerm.toString());
+                                if (state == State.SEARCH) {
+                                    searchIndex = searchBackwards(searchTerm.toString());
+                                } else {
+                                    searchIndex = searchForwards(searchTerm.toString());
+                                }
                             }
                             break;
 
                         case SELF_INSERT:
                             searchTerm.appendCodePoint(c);
-                            searchIndex = searchBackwards(searchTerm.toString());
+                            if (state == State.SEARCH) {
+                                searchIndex = searchBackwards(searchTerm.toString());
+                            } else {
+                                searchIndex = searchForwards(searchTerm.toString());
+                            }
                             break;
 
                         default:
@@ -2323,20 +2545,30 @@ public class ConsoleReader
                                 // set cursor position to the found string
                                 cursorDest = history.current().toString().indexOf(searchTerm.toString());
                             }
+                            if (o != Operation.ACCEPT_LINE) {
+                                o = null;
+                            }
                             state = State.NORMAL;
                             break;
                     }
 
                     // if we're still in search mode, print the search status
-                    if (state == State.SEARCH) {
+                    if (state == State.SEARCH || state == State.FORWARD_SEARCH) {
                         if (searchTerm.length() == 0) {
-                            printSearchStatus("", "");
+                            if (state == State.SEARCH) {
+                                printSearchStatus("", "");
+                            } else {
+                                printForwardSearchStatus("", "");
+                            }
                             searchIndex = -1;
                         } else {
                             if (searchIndex == -1) {
                                 beep();
-                            } else {
+                                printSearchStatus(searchTerm.toString(), "");
+                            } else if (state == State.SEARCH) {
                                 printSearchStatus(searchTerm.toString(), history.get(searchIndex).toString());
+                            } else {
+                                printForwardSearchStatus(searchTerm.toString(), history.get(searchIndex).toString());
                             }
                         }
                     }
@@ -2345,7 +2577,7 @@ public class ConsoleReader
                         restoreLine(originalPrompt, cursorDest);
                     }
                 }
-                if (state != State.SEARCH) {
+                if (state != State.SEARCH && state != State.FORWARD_SEARCH) {
                     /*
                      * If this is still false at the end of the switch, then
                      * we reset our repeatCount to 0.
@@ -2367,7 +2599,6 @@ public class ConsoleReader
 
                     if (o instanceof Operation) {
                         Operation op = (Operation)o;
-
                         /*
                          * Current location of the cursor (prior to the operation).
                          * These are used by vi *-to operation (e.g. delete-to)
@@ -2389,7 +2620,25 @@ public class ConsoleReader
 
                         switch ( op ) {
                             case COMPLETE: // tab
-                                success = complete();
+                                // There is an annoyance with tab completion in that
+                                // sometimes the user is actually pasting input in that
+                                // has physical tabs in it.  This attempts to look at how
+                                // quickly a character follows the tab, if the character
+                                // follows *immediately*, we assume it is a tab literal.
+                                boolean isTabLiteral = false;
+                                if (copyPasteDetection
+                                    && c == 9
+                                    && (!pushBackChar.isEmpty()
+                                        || (in.isNonBlockingEnabled() && in.peek(escapeTimeout) != -2))) {
+                                    isTabLiteral = true;
+                                }
+
+                                if (! isTabLiteral) {
+                                    success = complete();
+                                }
+                                else {
+                                    putString(opBuffer);
+                                }
                                 break;
 
                             case POSSIBLE_COMPLETIONS:
@@ -2398,6 +2647,14 @@ public class ConsoleReader
 
                             case BEGINNING_OF_LINE:
                                 success = setCursorPosition(0);
+                                break;
+
+                            case YANK:
+                                success = yank();
+                                break;
+
+                            case YANK_POP:
+                                success = yankPop();
                                 break;
 
                             case KILL_LINE: // CTRL-K
@@ -2410,6 +2667,7 @@ public class ConsoleReader
 
                             case CLEAR_SCREEN: // CTRL-L
                                 success = clearScreen();
+                                redrawLine();
                                 break;
 
                             case OVERWRITE_MODE:
@@ -2417,11 +2675,28 @@ public class ConsoleReader
                                 break;
 
                             case SELF_INSERT:
-                                putString(sb);
+                                putString(opBuffer);
                                 break;
 
                             case ACCEPT_LINE:
                                 return accept();
+
+                            case ABORT:
+                                if (searchTerm == null) {
+                                    abort();
+                                }
+                                break;
+
+                            case INTERRUPT:
+                                if (handleUserInterrupt) {
+                                    println();
+                                    flush();
+                                    String partialLine = buf.buffer.toString();
+                                    buf.clear();
+                                    history.moveToEnd();
+                                    throw new UserInterruptException(partialLine);
+                                }
+                                break;
 
                             /*
                              * VI_MOVE_ACCEPT_LINE is the result of an ENTER
@@ -2505,9 +2780,11 @@ public class ConsoleReader
                             case BACKWARD_KILL_WORD:
                                 success = deletePreviousWord();
                                 break;
+
                             case KILL_WORD:
                                 success = deleteNextWord();
                                 break;
+
                             case BEGINNING_OF_HISTORY:
                                 success = history.moveToFirst();
                                 if (success) {
@@ -2522,8 +2799,46 @@ public class ConsoleReader
                                 }
                                 break;
 
-                            case REVERSE_SEARCH_HISTORY:
                             case HISTORY_SEARCH_BACKWARD:
+                                searchTerm = new StringBuffer(buf.upToCursor());
+                                searchIndex = searchBackwards(searchTerm.toString(), history.index(), true);
+
+                                if (searchIndex == -1) {
+                                    beep();
+                                } else {
+                                    // Maintain cursor position while searching.
+                                    success = history.moveTo(searchIndex);
+                                    if (success) {
+                                        setBufferKeepPos(history.current());
+                                    }
+                                }
+                                break;
+
+                            case HISTORY_SEARCH_FORWARD:
+                                searchTerm = new StringBuffer(buf.upToCursor());
+                                int index = history.index() + 1;
+
+                                if (index == history.size()) {
+                                    history.moveToEnd();
+                                    setBufferKeepPos(searchTerm.toString());
+                                } else if (index < history.size()) {
+                                    searchIndex = searchForwards(searchTerm.toString(), index, true);
+                                    if (searchIndex == -1) {
+                                        beep();
+                                    } else {
+                                        // Maintain cursor position while searching.
+                                        success = history.moveTo(searchIndex);
+                                        if (success) {
+                                            setBufferKeepPos(history.current());
+                                        }
+                                    }
+                                }
+                                break;
+
+                            case REVERSE_SEARCH_HISTORY:
+                                originalBuffer = new CursorBuffer();
+                                originalBuffer.write(buf.buffer);
+                                originalBuffer.cursor = buf.cursor;
                                 if (searchTerm != null) {
                                     previousSearchTerm = searchTerm.toString();
                                 }
@@ -2539,6 +2854,28 @@ public class ConsoleReader
                                 } else {
                                     searchIndex = -1;
                                     printSearchStatus("", "");
+                                }
+                                break;
+
+                            case FORWARD_SEARCH_HISTORY:
+                                originalBuffer = new CursorBuffer();
+                                originalBuffer.write(buf.buffer);
+                                originalBuffer.cursor = buf.cursor;
+                                if (searchTerm != null) {
+                                    previousSearchTerm = searchTerm.toString();
+                                }
+                                searchTerm = new StringBuffer(buf.buffer);
+                                state = State.FORWARD_SEARCH;
+                                if (searchTerm.length() > 0) {
+                                    searchIndex = searchForwards(searchTerm.toString());
+                                    if (searchIndex == -1) {
+                                        beep();
+                                    }
+                                    printForwardSearchStatus(searchTerm.toString(),
+                                            searchIndex > -1 ? history.get(searchIndex).toString() : "");
+                                } else {
+                                    searchIndex = -1;
+                                    printForwardSearchStatus("", "");
                                 }
                                 break;
 
@@ -2572,14 +2909,14 @@ public class ConsoleReader
 
                             case END_KBD_MACRO:
                                 recording = false;
-                                macro = macro.substring(0, macro.length() - sb.length());
+                                macro = macro.substring(0, macro.length() - opBuffer.length());
                                 break;
 
                             case CALL_LAST_KBD_MACRO:
                                 for (int i = 0; i < macro.length(); i++) {
                                     pushBackChar.push(macro.charAt(macro.length() - 1 - i));
                                 }
-                                sb.setLength( 0 );
+                                opBuffer.setLength(0);
                                 break;
 
                             case VI_EDITING_MODE:
@@ -2594,7 +2931,7 @@ public class ConsoleReader
                                  * only move on an expclit entry to movement
                                  * mode.
                                  */
-                                if (state == state.NORMAL) {
+                                if (state == State.NORMAL) {
                                     moveCursor(-1);
                                 }
                                 consoleKeys.setKeyMap(KeyMap.VI_MOVE);
@@ -2652,25 +2989,29 @@ public class ConsoleReader
                                 break;
 
                             case VI_SEARCH:
-                                int lastChar = viSearch(sb.charAt (0));
+                                int lastChar = viSearch(opBuffer.charAt(0));
                                 if (lastChar != -1) {
                                     pushBackChar.push((char)lastChar);
                                 }
                                 break;
 
                             case VI_ARG_DIGIT:
-                                repeatCount = (repeatCount * 10) + sb.charAt(0) - '0';
+                                repeatCount = (repeatCount * 10) + opBuffer.charAt(0) - '0';
                                 isArgDigit = true;
                                 break;
 
-                            case VI_BEGNNING_OF_LINE_OR_ARG_DIGIT:
+                            case VI_BEGINNING_OF_LINE_OR_ARG_DIGIT:
                                 if (repeatCount > 0) {
-                                    repeatCount = (repeatCount * 10) + sb.charAt(0) - '0';
+                                    repeatCount = (repeatCount * 10) + opBuffer.charAt(0) - '0';
                                     isArgDigit = true;
                                 }
                                 else {
                                     success = setCursorPosition(0);
                                 }
+                                break;
+
+                            case VI_FIRST_PRINT:
+                                success = setCursorPosition(0) && viNextWord(1);
                                 break;
 
                             case VI_PREV_WORD:
@@ -2735,6 +3076,11 @@ public class ConsoleReader
                                     state = State.VI_CHANGE_TO;
                                 }
                                 break;
+                            
+                            case VI_KILL_WHOLE_LINE:
+                                success = setCursorPosition(0) && killLine();
+                                consoleKeys.setKeyMap(KeyMap.VI_INSERT);
+                                break;
 
                             case VI_PUT:
                                 success = viPut(count);
@@ -2762,9 +3108,30 @@ public class ConsoleReader
                                         ? readCharacter()
                                         : pushBackChar.pop());
                                 break;
+                            
+                            case VI_DELETE_TO_EOL:
+                                success = viDeleteTo(buf.cursor, buf.buffer.length(), false);
+                                break;
+                                
+                            case VI_CHANGE_TO_EOL:
+                                success = viDeleteTo(buf.cursor, buf.buffer.length(), true);
+                                consoleKeys.setKeyMap(KeyMap.VI_INSERT);
+                                break;
 
                             case EMACS_EDITING_MODE:
                                 consoleKeys.setKeyMap(KeyMap.EMACS);
+                                break;
+
+                            case QUIT:
+                                getCursorBuffer().clear();
+                                return accept();
+
+                            case QUOTED_INSERT:
+                                quotedInsert = true;
+                                break;
+
+                            case PASTE_FROM_CLIPBOARD:
+                                paste();
                                 break;
 
                             default:
@@ -2777,10 +3144,10 @@ public class ConsoleReader
                          */
                         if (origState != State.NORMAL) {
                             if (origState == State.VI_DELETE_TO) {
-                                success = viDeleteTo(cursorStart, buf.cursor);
+                                success = viDeleteTo(cursorStart, buf.cursor, false);
                             }
                             else if (origState == State.VI_CHANGE_TO) {
-                                success = viDeleteTo(cursorStart, buf.cursor);
+                                success = viDeleteTo(cursorStart, buf.cursor, true);
                                 consoleKeys.setKeyMap(KeyMap.VI_INSERT);
                             }
                             else if (origState == State.VI_YANK_TO) {
@@ -2801,18 +3168,29 @@ public class ConsoleReader
                              */
                             repeatCount = 0;
                         }
+
+                        if (state != State.SEARCH && state != State.FORWARD_SEARCH) {
+                            originalBuffer = null;
+                            previousSearchTerm = "";
+                            searchTerm = null;
+                            searchIndex = -1;
+                        }
                     }
                 }
                 if (!success) {
                     beep();
                 }
-                sb.setLength( 0 );
+                opBuffer.setLength(0);
+
                 flush();
             }
         }
         finally {
             if (!terminal.isSupported()) {
                 afterReadLine();
+            }
+            if (handleUserInterrupt && (terminal instanceof UnixTerminal)) {
+                ((UnixTerminal) terminal).enableInterruptCharacter();
             }
         }
     }
@@ -3016,7 +3394,6 @@ public class ConsoleReader
      * @param next If true, move forward
      * @param count The number of entries to move
      * @return true if the move was successful
-     * @throws IOException
      */
     private boolean moveHistory(final boolean next, int count) throws IOException {
         boolean ok = true;
@@ -3049,85 +3426,86 @@ public class ConsoleReader
     public static final String CR = Configuration.getLineSeparator();
 
     /**
-     * Output the specified character to the output stream without manipulating the current buffer.
-     */
-    private void print(final int c) throws IOException {
-        if (c == '\t') {
-            char chars[] = new char[TAB_WIDTH];
-            Arrays.fill(chars, ' ');
-            out.write(chars);
-            return;
-        }
-
-        out.write(c);
-    }
-
-    /**
      * Output the specified characters to the output stream without manipulating the current buffer.
      */
-    private void print(final char... buff) throws IOException {
-        int len = 0;
-        for (char c : buff) {
-            if (c == '\t') {
-                len += TAB_WIDTH;
-            }
-            else {
-                len++;
-            }
-        }
-
-        char chars[];
-        if (len == buff.length) {
-            chars = buff;
-        }
-        else {
-            chars = new char[len];
-            int pos = 0;
-            for (char c : buff) {
-                if (c == '\t') {
-                    Arrays.fill(chars, pos, pos + TAB_WIDTH, ' ');
-                    pos += TAB_WIDTH;
-                }
-                else {
-                    chars[pos] = c;
-                    pos++;
-                }
-            }
-        }
-
-        out.write(chars);
+    private int print(final CharSequence buff, int cursorPos) throws IOException {
+        return print(buff, 0, buff.length(), cursorPos);
     }
 
-    private void print(final char c, final int num) throws IOException {
-        if (num == 1) {
-            print(c);
+    private int print(final CharSequence buff, int start, int end) throws IOException {
+        return print(buff, start, end, getCursorPosition());
+    }
+
+    private int print(final CharSequence buff, int start, int end, int cursorPos) throws IOException {
+        checkNotNull(buff);
+        for (int i = start; i < end; i++) {
+            char c = buff.charAt(i);
+            if (c == '\t') {
+                int nb = nextTabStop(cursorPos);
+                cursorPos += nb;
+                while (nb-- > 0) {
+                    out.write(' ');
+                }
+            } else if (c < 32) {
+                out.write('^');
+                out.write((char) (c + '@'));
+                cursorPos += 2;
+            } else {
+                int w = WCWidth.wcwidth(c);
+                if (w > 0) {
+                    out.write(c);
+                    cursorPos += w;
+                }
+            }
         }
-        else {
-            char[] chars = new char[num];
-            Arrays.fill(chars, c);
-            print(chars);
-        }
+        cursorOk = false;
+        return cursorPos;
     }
 
     /**
      * Output the specified string to the output stream (but not the buffer).
      */
-    public final void print(final CharSequence s) throws IOException {
-        print(checkNotNull(s).toString().toCharArray());
+    public void print(final CharSequence s) throws IOException {
+        print(s, getCursorPosition());
     }
 
-    public final void println(final CharSequence s) throws IOException {
-        print(checkNotNull(s).toString().toCharArray());
+    public void println(final CharSequence s) throws IOException {
+        print(s);
         println();
     }
 
     /**
      * Output a platform-dependant newline.
      */
-    public final void println() throws IOException {
-        print(CR);
-//        flush();
+    public void println() throws IOException {
+        tputs("carriage_return");
+        rawPrint('\n');
     }
+
+    /**
+     * Raw output printing
+     */
+    final void rawPrint(final int c) throws IOException {
+        out.write(c);
+        cursorOk = false;
+    }
+
+    final void rawPrint(final String str) throws IOException {
+        out.write(str);
+        cursorOk = false;
+    }
+
+    private void rawPrint(final char c, final int num) throws IOException {
+        for (int i = 0; i < num; i++) {
+            rawPrint(c);
+        }
+    }
+
+    private void rawPrintln(final String s) throws IOException {
+        rawPrint(s);
+        println();
+    }
+
 
     //
     // Actions
@@ -3138,30 +3516,15 @@ public class ConsoleReader
      *
      * @return true if successful
      */
-    public final boolean delete() throws IOException {
-        return delete(1) == 1;
-    }
-
-    // FIXME: delete(int) only used by above + the return is always 1 and num is ignored
-
-    /**
-     * Issue <em>num</em> deletes.
-     *
-     * @return the number of characters backed up
-     */
-    private int delete(final int num) throws IOException {
-        // TODO: Try to use jansi for this
-
-        /* Commented out because of DWA-2949:
-        if (buf.cursor == 0) {
-            return 0;
+    public boolean delete() throws IOException {
+        if (buf.cursor == buf.buffer.length()) {
+          return false;
         }
-        */
 
         buf.buffer.delete(buf.cursor, buf.cursor + 1);
         drawBuffer(1);
 
-        return 1;
+        return true;
     }
 
     /**
@@ -3177,13 +3540,48 @@ public class ConsoleReader
             return false;
         }
 
-        int num = buf.buffer.length() - cp;
-        clearAhead(num, 0);
+        int num = len - cp;
+        int pos = getCursorPosition();
+        int width = wcwidth(buf.buffer, cp, len, pos);
+        clearAhead(width, pos);
 
-        for (int i = 0; i < num; i++) {
-            buf.buffer.deleteCharAt(len - i - 1);
+        char[] killed = new char[num];
+        buf.buffer.getChars(cp, (cp + num), killed, 0);
+        buf.buffer.delete(cp, (cp + num));
+
+        String copy = new String(killed);
+        killRing.add(copy);
+
+        return true;
+    }
+
+    public boolean yank() throws IOException {
+        String yanked = killRing.yank();
+
+        if (yanked == null) {
+            return false;
+        }
+        putString(yanked);
+        return true;
+    }
+
+    public boolean yankPop() throws IOException {
+        if (!killRing.lastYank()) {
+            return false;
+        }
+        String current = killRing.yank();
+        if (current == null) {
+            // This shouldn't happen.
+            return false;
+        }
+        backspace(current.length());
+        String yanked = killRing.yankPop();
+        if (yanked == null) {
+            // This shouldn't happen.
+            return false;
         }
 
+        putString(yanked);
         return true;
     }
 
@@ -3191,18 +3589,9 @@ public class ConsoleReader
      * Clear the screen by issuing the ANSI "clear screen" code.
      */
     public boolean clearScreen() throws IOException {
-        if (!terminal.isAnsiSupported()) {
-            return false;
+        if (!tputs("clear_screen")) {
+            println();
         }
-
-        // send the ANSI code to clear the screen
-        printAnsiSequence("2J");
-
-        // then send the ANSI code to go to position 1,1
-        printAnsiSequence("1;1H");
-
-        redrawLine();
-
         return true;
     }
 
@@ -3211,9 +3600,10 @@ public class ConsoleReader
      */
     public void beep() throws IOException {
         if (bellEnabled) {
-            print(KEYBOARD_BELL);
-            // need to flush so the console actually beeps
-            flush();
+            if (tputs("bell")) {
+                // need to flush so the console actually beeps
+                flush();
+            }
         }
     }
 
@@ -3242,6 +3632,7 @@ public class ConsoleReader
         }
 
         try {
+            @SuppressWarnings("deprecation")
             Object content = transferable.getTransferData(DataFlavor.plainTextFlavor);
 
             // This fix was suggested in bug #1060649 at
@@ -3298,12 +3689,6 @@ public class ConsoleReader
         }
     }
 
-    //
-    // Triggered Actions
-    //
-
-    private final Map<Character, ActionListener> triggeredActions = new HashMap<Character, ActionListener>();
-
     /**
      * Adding a triggered Action allows to give another curse of action if a character passed the pre-processing.
      * <p/>
@@ -3311,7 +3696,7 @@ public class ConsoleReader
      * addTriggerAction('q', new ActionListener(){ System.exit(0); }); would do the trick.
      */
     public void addTriggeredAction(final char c, final ActionListener listener) {
-        triggeredActions.put(c, listener);
+        getKeys().bind(Character.toString(c), listener);
     }
 
     //
@@ -3331,7 +3716,9 @@ public class ConsoleReader
 
         int maxWidth = 0;
         for (CharSequence item : items) {
-            maxWidth = Math.max(maxWidth, item.length());
+            // we use 0 here, as we don't really support tabulations inside candidates
+            int len = wcwidth(Ansi.stripAnsi(item.toString()), 0);
+            maxWidth = Math.max(maxWidth, len);
         }
         maxWidth = maxWidth + 3;
         Log.debug("Max width: ", maxWidth);
@@ -3345,10 +3732,12 @@ public class ConsoleReader
         }
 
         StringBuilder buff = new StringBuilder();
+        int realLength = 0;
         for (CharSequence item : items) {
-            if ((buff.length() + maxWidth) > width) {
-                println(buff);
+            if ((realLength + maxWidth) > width) {
+                rawPrintln(buff.toString());
                 buff.setLength(0);
+                realLength = 0;
 
                 if (--showLines == 0) {
                     // Overflow
@@ -3364,7 +3753,7 @@ public class ConsoleReader
                         showLines = height - 1;
                     }
 
-                    back(resources.getString("DISPLAY_MORE").length());
+                    tputs("carriage_return");
                     if (c == 'q') {
                         // cancel
                         break;
@@ -3374,13 +3763,15 @@ public class ConsoleReader
 
             // NOTE: toString() is important here due to AnsiString being retarded
             buff.append(item.toString());
-            for (int i = 0; i < (maxWidth - item.length()); i++) {
+            int strippedItemLength = wcwidth(Ansi.stripAnsi(item.toString()), 0);
+            for (int i = 0; i < (maxWidth - strippedItemLength); i++) {
                 buff.append(' ');
             }
+            realLength += maxWidth;
         }
 
         if (buff.length() > 0) {
-            println(buff);
+            rawPrintln(buff.toString());
         }
     }
 
@@ -3449,7 +3840,12 @@ public class ConsoleReader
 
         // backspace all text, including prompt
         buf.buffer.append(this.prompt);
-        buf.cursor += this.prompt.length();
+        int promptLength = 0;
+        if (this.prompt != null) {
+            promptLength = this.prompt.length();
+        }
+
+        buf.cursor += promptLength;
         setPrompt("");
         backspaceAll();
 
@@ -3465,10 +3861,17 @@ public class ConsoleReader
     }
 
     public void printSearchStatus(String searchTerm, String match) throws IOException {
-        String prompt = "(reverse-i-search)`" + searchTerm + "': ";
-        String buffer = match;
+        printSearchStatus(searchTerm, match, "(reverse-i-search)`");
+    }
+
+    public void printForwardSearchStatus(String searchTerm, String match) throws IOException {
+        printSearchStatus(searchTerm, match, "(i-search)`");
+    }
+
+    private void printSearchStatus(String searchTerm, String match, String searchLabel) throws IOException {
+        String prompt = searchLabel + searchTerm + "': ";
         int cursorDest = match.indexOf(searchTerm);
-        resetPromptLine(prompt, buffer, cursorDest);
+        resetPromptLine(prompt, match, cursorDest);
     }
 
     public void restoreLine(String originalPrompt, int cursorDest) throws IOException {
@@ -3520,6 +3923,52 @@ public class ConsoleReader
         return -1;
     }
 
+    /**
+     * Search forward in history from a given position.
+     *
+     * @param searchTerm substring to search for.
+     * @param startIndex the index from which on to search
+     * @return index where this substring has been found, or -1 else.
+     */
+    public int searchForwards(String searchTerm, int startIndex) {
+        return searchForwards(searchTerm, startIndex, false);
+    }
+    /**
+     * Search forwards in history from the current position.
+     *
+     * @param searchTerm substring to search for.
+     * @return index where the substring has been found, or -1 else.
+     */
+    public int searchForwards(String searchTerm) {
+        return searchForwards(searchTerm, history.index());
+    }
+
+    public int searchForwards(String searchTerm, int startIndex, boolean startsWith) {
+        if (startIndex >= history.size()) {
+            startIndex = history.size() - 1;
+        }
+
+        ListIterator<History.Entry> it = history.entries(startIndex);
+
+        if (searchIndex != -1 && it.hasNext()) {
+            it.next();
+        }
+
+        while (it.hasNext()) {
+            History.Entry e = it.next();
+            if (startsWith) {
+                if (e.value().toString().startsWith(searchTerm)) {
+                    return e.index();
+                }
+            } else {
+                if (e.value().toString().contains(searchTerm)) {
+                    return e.index();
+                }
+            }
+        }
+        return -1;
+    }
+
     //
     // Helpers
     //
@@ -3531,7 +3980,7 @@ public class ConsoleReader
      * @param c     The character to test
      * @return      True if it is a delimiter
      */
-    private boolean isDelimiter(final char c) {
+    private static boolean isDelimiter(final char c) {
         return !Character.isLetterOrDigit(c);
     }
 
@@ -3544,15 +3993,17 @@ public class ConsoleReader
      * @param c The character to check
      * @return true if the character is a whitespace
      */
-    private boolean isWhitespace(final char c) {
+    private static boolean isWhitespace(final char c) {
         return Character.isWhitespace (c);
     }
 
-    private void printAnsiSequence(String sequence) throws IOException {
-        print(27);
-        print('[');
-        print(sequence);
-        flush(); // helps with step debugging
+    private boolean tputs(String cap, Object... params) throws IOException {
+        String str = terminal.getStringCapability(cap);
+        if (str == null) {
+            return false;
+        }
+        Curses.tputs(out, str, params);
+        return true;
     }
 
 }

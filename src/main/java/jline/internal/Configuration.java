@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2012, the original author or authors.
+ * Copyright (c) 2002-2016, the original author or authors.
  *
  * This software is distributable under the BSD license. See the terms of the
  * BSD license in the documentation provided with this software.
@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
 import java.nio.charset.Charset;
+import java.nio.charset.IllegalCharsetNameException;
 import java.util.Map;
 import java.util.Properties;
 
@@ -138,6 +139,10 @@ public class Configuration
         return getString(name, null);
     }
 
+    public static boolean getBoolean(final String name) {
+        return getBoolean(name, false);
+    }
+
     public static boolean getBoolean(final String name, final boolean defaultValue) {
         String value = getString(name);
         if (value == null) {
@@ -197,18 +202,56 @@ public class Configuration
         return getOsName().startsWith("windows");
     }
 
-    // FIXME: Sort out use of property access of file.encoding in InputStreamReader, consolidate should configuration access here
+    public static boolean isHpux() {
+        return getOsName().startsWith("hp");
+    }
+
+    // FIXME: Sort out use of property access of file.encoding in InputStreamReader, should consolidate configuration access here
 
     public static String getFileEncoding() {
         return System.getProperty("file.encoding");
     }
 
+    /**
+     * Get the default encoding.  Will first look at the LC_ALL, LC_CTYPE, and LANG environment variables, then the input.encoding
+     * system property, then the default charset according to the JVM.
+     *
+     * @return The default encoding to use when none is specified.
+     */
     public static String getEncoding() {
-        // LC_CTYPE is usually in the form en_US.UTF-8
-        String ctype = System.getenv("LC_CTYPE");
-        if (ctype != null && ctype.indexOf('.') > 0) {
-            return ctype.substring(ctype.indexOf('.') + 1);
+        // Check for standard locale environment variables, in order of precedence, first.
+        // See http://www.gnu.org/s/libc/manual/html_node/Locale-Categories.html
+        for (String envOption : new String[]{"LC_ALL", "LC_CTYPE", "LANG"}) {
+            String envEncoding = extractEncodingFromCtype(System.getenv(envOption));
+            if (envEncoding != null) {
+                try {
+                    if (Charset.isSupported(envEncoding)) {
+                        return envEncoding;
+                    }
+                } catch (IllegalCharsetNameException e) {
+                    continue;
+                }
+            }
         }
-        return System.getProperty("input.encoding", Charset.defaultCharset().name());
+        return getString("input.encoding", Charset.defaultCharset().name());
+    }
+
+    /**
+     * Parses the LC_CTYPE value to extract the encoding according to the POSIX standard, which says that the LC_CTYPE
+     * environment variable may be of the format <code>[language[_territory][.codeset][@modifier]]</code>
+     *
+     * @param ctype The ctype to parse, may be null
+     * @return The encoding, if one was present, otherwise null
+     */
+    static String extractEncodingFromCtype(String ctype) {
+        if (ctype != null && ctype.indexOf('.') > 0) {
+            String encodingAndModifier = ctype.substring(ctype.indexOf('.') + 1);
+            if (encodingAndModifier.indexOf('@') > 0) {
+                return encodingAndModifier.substring(0, encodingAndModifier.indexOf('@'));
+            } else {
+                return encodingAndModifier;
+            }
+        }
+        return null;
     }
 }

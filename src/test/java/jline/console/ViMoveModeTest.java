@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2012, the original author or authors.
+ * Copyright (c) 2002-2016, the original author or authors.
  *
  * This software is distributable under the BSD license. See the terms of the
  * BSD license in the documentation provided with this software.
@@ -484,6 +484,45 @@ public class ViMoveModeTest
     }
     
     @Test
+    public void testD() throws Exception {
+        // D is a vim extension for delete-to-end-of-line
+        console.setKeyMap(KeyMap.VI_INSERT);
+        Buffer b = (new Buffer("banana"))
+            .escape()
+            .left(2)
+            .append("Dadaid")
+            .enter();
+        assertLine("bandaid", b, false);
+        assertTrue(console.isKeyMap(KeyMap.VI_INSERT));
+    }
+    
+    @Test
+    public void testC() throws Exception {
+        // C is a vim extension for change-to-end-of-line
+        console.setKeyMap(KeyMap.VI_INSERT);
+        Buffer b = (new Buffer("yogurt"))
+            .escape()
+            .left(3)
+            .append("Cyo")
+            .enter();
+        assertLine("yoyo", b, false);
+        assertTrue(console.isKeyMap(KeyMap.VI_INSERT));
+    }
+    
+    @Test
+    public void testS() throws Exception {
+        // S is a vim extension that is a synonum for 'cc' (clear whole line)
+        console.setKeyMap(KeyMap.VI_INSERT);
+        Buffer b = (new Buffer("great lakes brewery"))
+            .escape()
+            .left(3)
+            .append("Sdogfishhead")
+            .enter();
+        assertLine("dogfishhead", b, false);
+        assertTrue(console.isKeyMap(KeyMap.VI_INSERT));
+    }
+    
+    @Test
     public void testEndOfLine() throws Exception {
         /*
          * The $ key causes the cursor to move to the end of the line
@@ -526,6 +565,16 @@ public class ViMoveModeTest
             .append("0lly$$p")
             .enter();
         assertLine("chicken sushimiicken sushimi", b, false);
+    }
+
+    @Test
+    public void firstPrintable() throws Exception {
+      console.setKeyMap(KeyMap.VI_INSERT);
+      Buffer b = (new Buffer(" foo bar"))
+        .escape()
+        .append("^dw")
+        .enter();
+      assertLine(" bar", b, false);
     }
     
     @Test
@@ -1210,7 +1259,6 @@ public class ViMoveModeTest
      * CTRL-J or CTRL-M...maybe others.
      * 
      * @param enterChar The escape character that acts as enter.
-     * @throws Exception
      */
     private void testEnter(char enterChar) throws Exception {
         /*
